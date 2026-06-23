@@ -1,6 +1,7 @@
 """Devices that represent lights"""
 import asyncio
 import logging
+import re
 
 from .fah_device import FahDevice
 from ..const import (
@@ -123,7 +124,18 @@ class FahLight(FahDevice):
             await self.client.set_datapoint(self.serialnumber, self.channel_id, self._datapoints[PID_COLOR_TEMPERATURE], str(self.color_temp))
 
         if self.is_rgb():
-            await self.client.set_datapoint(self.serialnumber, self.channel_id, self._datapoints[PID_RGB], str(self.rgb_color))
+            # Format RGB for outgoing datapoint. Use CSV "R,G,B" which is accepted by many implementations.
+            rgb_val = None
+            if isinstance(self.rgb_color, int):
+                r = (self.rgb_color >> 16) & 255
+                g = (self.rgb_color >> 8) & 255
+                b = self.rgb_color & 255
+                rgb_val = f"{r},{g},{b}"
+            else:
+                # fallback to string conversion
+                rgb_val = str(self.rgb_color)
+
+            await self.client.set_datapoint(self.serialnumber, self.channel_id, self._datapoints[PID_RGB], rgb_val)
 
     async def turn_off(self):
         """ Turn the light off   """
@@ -169,6 +181,72 @@ class FahLight(FahDevice):
         red =   (self.rgb_color >> 16) & 255
         return red, green, blue
 
+    def _parse_rgb_to_int(self, value):
+        """Parse various RGB formats to an integer (R<<16 | G<<8 | B).
+
+        Accepts:
+        - integer (returned as-is)
+        - decimal string (e.g. "16711680")
+        - hex string with 0x or # prefix (e.g. "0xFF0000", "#FF0000")
+        - plain hex string (e.g. "FF0000")
+        - CSV/space/semicolon separated "R,G,B" (e.g. "255,0,0")
+
+        Returns integer on success or None on parse failure.
+        """
+        if value is None:
+            return None
+
+        # Already an int
+        if isinstance(value, int):
+            return value
+
+        try:
+            v = str(value).strip()
+        except Exception:
+            return None
+
+        if not v:
+            return None
+
+        # Hex with 0x prefix
+        if v.startswith(('0x', '0X')):
+            try:
+                return int(v, 16)
+            except Exception:
+                return None
+
+        # Hex with # prefix
+        if v.startswith('#'):
+            try:
+                return int(v[1:], 16)
+            except Exception:
+                return None
+
+        # Decimal integer string
+        try:
+            return int(v)
+        except Exception:
+            pass
+
+        # CSV / space / semicolon separated R G B
+        if any(sep in v for sep in (',', ';')) or re.search(r"\s+", v):
+            parts = re.split(r'[,;\s]+', v)
+            if len(parts) == 3:
+                try:
+                    r, g, b = (int(p) for p in parts)
+                    return (r << 16) | (g << 8) | b
+                except Exception:
+                    return None
+
+        # Plain hex (e.g. "FF0000")
+        if re.fullmatch(r'[0-9a-fA-F]+', v):
+            try:
+                return int(v, 16)
+            except Exception:
+                return None
+
+        return None
+
     def is_on(self):
         """ Return the state of the light   """
         return self.state
@@ -198,8 +276,12 @@ class FahLight(FahDevice):
             LOG.info("light device %s (%s) dp %s color temperature %s", self.name, self.lookup_key, dp, value)
 
         elif PID_INFO_RGB in self._datapoints and self._datapoints[PID_INFO_RGB] == dp:
-            self.rgb_color = int(value)
-            LOG.info("light device %s (%s) dp %s rgb color %s", self.name, self.lookup_key, dp, value)
+            parsed = self._parse_rgb_to_int(value)
+            if parsed is not None:
+                self.rgb_color = int(parsed)
+                LOG.info("light device %s (%s) dp %s rgb color %s", self.name, self.lookup_key, dp, value)
+            else:
+                LOG.warning("light device %s (%s) dp %s unknown rgb format: %s", self.name, self.lookup_key, dp, value)
 
         else:
             LOG.info("light device %s (%s) unknown dp %s value %s", self.name, self.lookup_key, dp, value)
